@@ -19,7 +19,7 @@
 
  Клонирование репозитория
 
- git clone https://github.com/yourusername/SmartFridge.git cd SmartFridge
+ git clone https://github.com/Vladv2008/-SmartFridge-QR-Control-IoT-Sync-.git cd -SmartFridge-QR-Control-IoT-Sync-
 
  Создание виртуального окружения
 
