@@ -1,0 +1,905 @@
+import sqlite3
+import cv2
+from functools import partial
+from datetime import datetime, timedelta
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+from kivy.uix.recycleview import RecycleView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.anchorlayout import AnchorLayout
+from kivy.uix.widget import Widget
+from kivy.graphics import Color, Rectangle, Canvas
+from kivy.core.window import Window
+from kivy.metrics import mm
+from plyer import notification
+from pyzbar.pyzbar import decode
+
+width_px = mm(41.5)
+height_px = mm(91.5)
+Window.size = (width_px, height_px)
+
+
+def create_popup(title, content):
+    """Создает полноэкранное всплывающее окно с кнопкой закрытия"""
+    popup = Popup(title="", size_hint=(1, 1))
+    top_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=50)
+    close_button = Button(
+        text="✕", size_hint=(None, None), size=(40, 40),
+        background_color=(1, 0, 0, 1), color=(1, 1, 1, 1)
+    )
+    close_button.bind(on_press=popup.dismiss)
+    top_bar.add_widget(close_button)
+    main_content = BoxLayout(orientation="vertical", spacing=10, padding=10)
+    main_content.add_widget(top_bar)
+    main_content.add_widget(content)
+    popup.content = main_content
+    popup.open()
+    return popup
+conn = sqlite3.connect('fridge.db')
+c = conn.cursor()
+c.execute("PRAGMA table_info(shopping_list)")
+columns = [column[1] for column in c.fetchall()]
+
+try:
+    if 'quantity' not in columns:
+        c.execute("ALTER TABLE shopping_list ADD COLUMN quantity TEXT")
+        conn.commit()
+except sqlite3.OperationalError as e:
+    print(f"Ошибка SQLite: {e}")
+
+conn.close()
+
+import subprocess
+import platform
+
+def send_notification(title, message):
+    """Отправка локального уведомления на macOS."""
+    if platform.system() == "Darwin":  # Проверяем, что система - macOS
+        try:
+            script = f'''
+            on run
+                display notification "{message}" with title "{title}"
+            end run
+            '''
+            subprocess.run(["osascript", "-e", script])
+        except Exception as e:
+            print(f"Ошибка отправки уведомления: {e}")
+    else:
+        print(f"Уведомление: {title} - {message}")  # Фолбэк для других ОС
+
+
+def check_expired_products():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+
+    c.execute('SELECT name, expiration_date FROM products')
+    products = c.fetchall()
+
+    for name, expiration_date in products:
+        if expiration_date and expiration_date < today:
+            # Проверяем, логировалась ли уже просрочка за сегодняшний день
+            c.execute('SELECT COUNT(*) FROM product_logs WHERE product_name = ? AND action = "expired" AND event_date = ?', (name, today))
+            already_logged = c.fetchone()[0]
+
+            if already_logged == 0:  # Если за сегодня нет записи — добавляем
+                log_product_action(name, 'expired')
+                send_notification("Просроченный продукт!", f"Продукт '{name}' истёк по сроку годности.")
+
+    conn.close()
+
+
+
+def log_product_action(product_name, action):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO product_logs (product_name, action, event_date) VALUES (?, ?, DATE("now"))',
+              (product_name, action))
+    conn.commit()
+    conn.close()
+
+
+def remove_product(name):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('SELECT expiration_date FROM products WHERE name = ?', (name,))
+    result = c.fetchone()
+
+    if result:
+        expiration_date = result[0]
+        if expiration_date and expiration_date >= datetime.now().strftime('%Y-%m-%d'):
+            log_product_action(name, 'removed')  # Логируем только если продукт не просрочен
+
+    c.execute('DELETE FROM products WHERE name = ?', (name,))
+    conn.commit()
+    conn.close()
+
+
+
+def add_product(name, product_type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO products (name, type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+              (name, product_type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type))
+    conn.commit()
+
+    if expiration_date and expiration_date < datetime.now().strftime('%Y-%m-%d'):
+            log_product_action(name, 'expired')
+
+    conn.close()
+
+    check_expired_products()
+
+
+check_expired_products()
+
+
+
+def get_analytics(start_date, end_date):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+
+    query = '''
+    WITH actions_count AS (
+        SELECT
+            product_name,
+            action,
+            COUNT(*) AS count
+        FROM product_logs
+        WHERE event_date BETWEEN ? AND ?
+        GROUP BY product_name, action
+    ),
+    expired_products AS (
+        SELECT DISTINCT product_name
+        FROM product_logs
+        WHERE action = 'expired'
+    )
+    SELECT
+        p.product_name,
+        COALESCE(a_added.count, 0) AS added_count,
+        COALESCE(a_removed.count, 0) AS removed_count,
+        COALESCE(a_expired.count, 0) AS expired_count
+    FROM (SELECT DISTINCT product_name FROM product_logs UNION SELECT name AS product_name FROM products) p
+    LEFT JOIN actions_count a_added ON p.product_name = a_added.product_name AND a_added.action = 'added'
+    LEFT JOIN actions_count a_removed ON p.product_name = a_removed.product_name
+        AND a_removed.action = 'removed'
+        AND p.product_name NOT IN (SELECT product_name FROM expired_products)
+    LEFT JOIN actions_count a_expired ON p.product_name = a_expired.product_name AND a_expired.action = 'expired'
+    ORDER BY p.product_name;
+    '''
+    c.execute(query, (start_date, end_date))
+    analytics = c.fetchall()
+    conn.close()
+
+    return analytics
+
+
+def create_logs_table():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS product_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_name TEXT NOT NULL,
+        action TEXT CHECK(action IN ('added', 'removed', 'expired')) NOT NULL,
+        event_date TEXT NOT NULL
+    )''')
+    conn.commit()
+    conn.close()
+
+create_logs_table()
+
+
+def create_shopping_list_db():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS shopping_list (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        quantity TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+
+
+def add_to_shopping_list(name, quantity):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO shopping_list (name, quantity) VALUES (?, ?)', (name, quantity))
+    conn.commit()
+    conn.close()
+def remove_from_shopping_list(name):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+
+    c.execute('SELECT id, quantity FROM shopping_list WHERE name = ?', (name,))
+    item = c.fetchone()
+    if item:
+        item_id, quantity = item
+        new_quantity = int(quantity) - 1
+        if new_quantity > 0:
+            c.execute('UPDATE shopping_list SET quantity = ? WHERE id = ?', (new_quantity, item_id))
+        else:
+            c.execute('DELETE FROM shopping_list WHERE id = ?', (item_id,))
+    conn.commit()
+    conn.close()
+
+
+
+def clear_database():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM products')
+    c.execute('DELETE FROM product_logs')
+    c.execute('DELETE FROM shopping_list')
+    conn.commit()
+    conn.close()
+
+
+def get_shopping_list():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('SELECT name, quantity FROM shopping_list')
+    shopping_list = c.fetchall()
+    conn.close()
+    return shopping_list
+
+
+def create_db():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        type TEXT,
+        manufacturing_date TEXT,
+        expiration_date TEXT,
+        mass TEXT,
+        unit TEXT,
+        nutritional_value TEXT,
+        measurement_type TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+
+
+def get_all_products():
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('SELECT id, name, type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type FROM products')
+    products = c.fetchall()
+    conn.close()
+    return products
+
+
+def filter_products_by_name(search_text):
+    conn = sqlite3.connect('fridge.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM products WHERE name LIKE ?', ('%' + search_text + '%',))
+    products = c.fetchall()
+    conn.close()
+    return products
+
+
+
+def scan_qr_code():
+    cap = cv2.VideoCapture(0)
+    scanned_data = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Получаем размеры окна Kivy
+        window_width, window_height = Window.size
+
+        # Получаем соотношение сторон
+        frame_height, frame_width = frame.shape[:2]
+        aspect_ratio = frame_width / frame_height
+        window_aspect_ratio = window_width / window_height
+
+        if aspect_ratio > window_aspect_ratio:
+            # Экран уже, чем изображение - добавляем отступы сверху и снизу
+            new_width = window_width
+            new_height = int(window_width / aspect_ratio)
+            padding_top = (window_height - new_height) // 2
+            padding_bottom = window_height - new_height - padding_top
+            frame_resized = cv2.resize(frame, (new_width, new_height))
+            frame_padded = cv2.copyMakeBorder(
+                frame_resized, padding_top, padding_bottom, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        else:
+            # Экран шире, чем изображение - добавляем отступы по бокам
+            new_height = window_height
+            new_width = int(window_height * aspect_ratio)
+            padding_left = (window_width - new_width) // 2
+            padding_right = window_width - new_width - padding_left
+            frame_resized = cv2.resize(frame, (new_width, new_height))
+            frame_padded = cv2.copyMakeBorder(
+                frame_resized, 0, 0, padding_left, padding_right, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+
+        decoded_objects = decode(frame_padded)
+        for obj in decoded_objects:
+            scanned_data = obj.data.decode('utf-8')
+            cv2.destroyAllWindows()
+            cap.release()
+            return scanned_data
+
+        cv2.imshow("QR Code Scanner", frame_padded)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return None
+
+
+
+
+class ShoppingListScreen(BoxLayout):
+    def __init__(self, main_screen, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = 'vertical'
+        self.main_screen = main_screen
+
+        self.search_input = TextInput(hint_text="Поиск по названию продукта", size_hint_y=None, height=40)
+        self.search_input.bind(text=self.on_search)
+        self.add_widget(self.search_input)
+
+        self.shopping_list_view = RecycleView(size_hint=(1, 0.7))
+        self.add_widget(self.shopping_list_view)
+
+        self.input_box = BoxLayout(size_hint=(1, 0.2), orientation='vertical')
+        self.product_name_input = TextInput(hint_text="Название продукта", size_hint_y=None, height=40)
+        self.product_quantity_input = TextInput(hint_text="Количество", size_hint_y=None, height=40)
+        self.input_box.add_widget(self.product_name_input)
+        self.input_box.add_widget(self.product_quantity_input)
+
+        self.buttons_box = BoxLayout(size_hint_y=None, height=40)
+        self.add_button = Button(text="Добавить")
+        self.add_button.bind(on_press=self.add_product_to_list)
+        self.buttons_box.add_widget(self.add_button)
+        self.input_box.add_widget(self.buttons_box)
+        self.add_widget(self.input_box)
+
+        self.update_shopping_list()
+
+    def on_search(self, instance, value):
+        """Метод для фильтрации списка покупок по названию"""
+        self.update_shopping_list(search_text=value)
+
+    def update_shopping_list(self, search_text=""):
+        shopping_list = get_shopping_list()
+
+
+        if search_text:
+            shopping_list = [item for item in shopping_list if search_text.lower() in item[0].lower()]
+
+        container = BoxLayout(orientation='vertical', size_hint_y=None)
+        container.bind(minimum_height=container.setter('height'))
+
+        for item in shopping_list:
+            name, quantity = item
+            item_box = BoxLayout(size_hint_y=None, height=50)
+
+            item_label = Label(text=f"{name} ({quantity})", size_hint_x=0.7)
+            item_box.add_widget(item_label)
+
+
+            delete_button = Button(text="Удалить", size_hint_x=0.3)
+
+            delete_button.bind(on_press=partial(self.delete_product_from_list, name))
+
+            item_box.add_widget(delete_button)
+
+            container.add_widget(item_box)
+
+        self.shopping_list_view.clear_widgets()
+        self.shopping_list_view.add_widget(container)
+
+    def add_product_to_list(self, instance):
+        name = self.product_name_input.text.strip()
+        quantity = self.product_quantity_input.text.strip()
+
+        if name and quantity:
+            add_to_shopping_list(name, quantity)
+            self.update_shopping_list()
+            self.product_name_input.text = ""
+            self.product_quantity_input.text = ""
+
+    def delete_product_from_list(self, name, *args):
+        if isinstance(name, str):
+            remove_from_shopping_list(name)
+            self.update_shopping_list()
+
+    def add_product_to_list(self, instance):
+        name = self.product_name_input.text.strip()
+        quantity = self.product_quantity_input.text.strip()
+
+        if name and quantity:
+            add_to_shopping_list(name, quantity)
+            self.update_shopping_list()
+            self.product_name_input.text = ""
+            self.product_quantity_input.text = ""
+
+    def delete_product_from_list(self, name, *args):
+        if isinstance(name, str):
+            remove_from_shopping_list(name)
+            self.update_shopping_list()
+
+class MainScreen(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = 'vertical'
+
+        self.scan_button = Button(text="Сканировать QR-код", size_hint_y=None, height=40)
+        self.scan_button.bind(on_press=self.scan_and_add_product)
+        self.add_widget(self.scan_button)
+
+        self.analytics_button = Button(text="Показать аналитику", size_hint_y=None, height=40)
+        self.analytics_button.bind(on_press=self.show_analytics_screen)
+        self.add_widget(self.analytics_button)
+
+        self.shopping_list_button = Button(text="Список покупок", size_hint_y=None, height=40)
+        self.shopping_list_button.bind(on_press=self.show_shopping_list_screen)
+        self.add_widget(self.shopping_list_button)
+
+        self.search_input = TextInput(hint_text="Поиск продукта", size_hint_y=None, height=40)
+        self.search_input.bind(text=self.on_search)
+        self.add_widget(self.search_input)
+
+        self.product_list = RecycleView(size_hint=(1, 1))
+        self.add_widget(self.product_list)
+
+        self.clear_button = Button(text="Очистить историю", size_hint_y=None, height=40)
+        self.clear_button.bind(on_press=self.clear_db_handler)
+        self.add_widget(self.clear_button)
+
+        self.update_product_list()
+    def clear_db_handler(self, instance):
+        clear_database()
+        self.update_product_list()
+        self.show_popup("Успех", "История очищена.")
+
+    def show_analytics_screen(self, instance):
+        """Отображает окно для выбора периода и показывает аналитику."""
+        try:
+            date_popup = Popup(title="Выберите период", size_hint=(0.9, 0.35))
+            date_layout = BoxLayout(orientation="vertical", spacing=6, padding=10)
+
+            start_date_input = TextInput(hint_text="Дата начала (ГГГГ-ММ-ДД)", multiline=False, size_hint_y=None, height=42)
+            end_date_input = TextInput(hint_text="Дата конца (ГГГГ-ММ-ДД)", multiline=False, size_hint_y=None, height=42)
+
+            confirm_button = Button(text="Показать аналитику", size_hint_y=None, height=40)
+            confirm_button.bind(on_press=lambda instance: self.display_analytics(start_date_input.text, end_date_input.text))
+
+            date_layout.add_widget(start_date_input)
+            date_layout.add_widget(end_date_input)
+            date_layout.add_widget(confirm_button)
+
+            date_layout.add_widget(Widget(size_hint_y=None, height=20))
+
+            for period in ["Неделя", "Месяц", "Год"]:
+                button = Button(text=period, size_hint_y=None, height=40)
+                button.bind(on_press=lambda instance, p=period: on_period_selected(p))
+                date_layout.add_widget(button)
+
+            date_popup.content = date_layout
+            date_popup.open()
+
+        except Exception as e:
+            self.show_popup("Ошибка", f"Не удалось открыть окно выбора периода: {e}")
+
+        def calculate_dates(period):
+            """Вычисляет начальную и конечную даты на основе выбранного периода"""
+            today = datetime.now()
+            if period == "Неделя":
+                start_date = today - timedelta(days=7)
+            elif period == "Месяц":
+                start_date = today - timedelta(days=30)
+            elif period == "Год":
+                start_date = today - timedelta(days=365)
+            else:
+                start_date = today
+            return start_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+        def on_period_selected(period):
+            """Обрабатывает выбор периода и отображает аналитику"""
+            start_date, end_date = calculate_dates(period)
+            self.display_analytics(start_date, end_date)
+            date_popup.dismiss()
+
+
+
+    def display_analytics(self, start_date, end_date):
+        """Получает аналитику и отображает её в виде таблицы с фиксированными заголовками"""
+        try:
+            analytics = get_analytics(start_date, end_date)
+
+            if not analytics:
+                self.show_popup("Аналитика", "Нет данных за указанный период.")
+                return
+
+            popup = Popup(title="Аналитика", size_hint=(1, 1))
+
+            top_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=50)
+            close_button = Button(
+                text="✕", size_hint=(None, None), size=(40, 40),
+                background_color=(1, 0, 0, 1), color=(1, 1, 1, 1)
+            )
+            close_button.bind(on_press=popup.dismiss)
+            top_bar.add_widget(close_button)
+
+            content = BoxLayout(orientation="vertical", spacing=10, padding=10)
+            content.add_widget(top_bar)
+
+            content.add_widget(Label(
+                text="ТОП-Продукты:", bold=True, font_size=24,
+                size_hint_y=None, height=40, halign="left", valign="middle", text_size=(600, None)
+            ))
+
+            # Исправленный код: Корректное извлечение топовых продуктов
+            most_added = max(analytics, key=lambda x: x[1], default=None)
+            most_removed = max(analytics, key=lambda x: x[2], default=None)
+            most_expired = max(analytics, key=lambda x: x[3], default=None)
+
+            # Отображаем топовые продукты, если они существуют
+            if most_added:
+                content.add_widget(Label(
+                    text=f"Чаще всего добавлялся: {most_added[0]} ({most_added[1]} раз)",
+                    size_hint_y=None, height=35, font_size=23,
+                    halign="left", valign="middle", text_size=(600, None)
+                ))
+
+            if most_removed:
+                content.add_widget(Label(
+                    text=f"Чаще всего употреблялся: {most_removed[0]} ({most_removed[2]} раз)",
+                    size_hint_y=None, height=35, font_size=23,
+                    halign="left", valign="middle", text_size=(600, None)
+                ))
+
+            if most_expired:
+                content.add_widget(Label(
+                    text=f"Чаще всего портился: {most_expired[0]} ({most_expired[3]} раз)",
+                    size_hint_y=None, height=35, font_size=23,
+                    halign="left", valign="middle", text_size=(600, None)
+                ))
+
+            # Создаем заголовки таблицы
+            header_layout = GridLayout(cols=4, size_hint_y=None, height=50)
+            headers = ["Продукт", "Добавлено", "Удалено", "Портилось"]
+            for header in headers:
+                header_layout.add_widget(Label(
+                    text=header, bold=True, font_size=20,
+                    halign="center", valign="middle", text_size=(200, None)
+                ))
+
+            content.add_widget(header_layout)
+
+            # Таблица аналитики
+            table_layout = GridLayout(cols=4, size_hint_y=None, row_default_height=50, spacing=[0, 1])
+            table_layout.bind(minimum_height=table_layout.setter("height"))
+
+            for row in analytics:
+                product_name, added, removed, expired = row
+
+                for data in [product_name, str(added), str(removed), str(expired)]:
+                    label = Label(
+                        text=data, size_hint_x=0.25, font_size=20,
+                        halign="left" if data == product_name else "center", valign="middle",
+                        text_size=(200, None)
+                    )
+                    label.bind(size=label.setter("text_size"))
+                    table_layout.add_widget(label)
+
+            scroll_view = ScrollView(size_hint=(1, 1))
+            scroll_view.add_widget(table_layout)
+
+            content.add_widget(scroll_view)
+
+            popup.content = content
+            popup.open()
+
+        except Exception as e:
+            self.show_popup("Ошибка", f"Не удалось получить аналитику: {e}")
+
+
+    def on_search(self, instance, value):
+        """Метод, который обновляет список продуктов по введенному тексту"""
+        self.update_product_list(search_text=value)
+
+    def update_product_list(self, search_text=""):
+        """Метод для отображения продуктов с возможностью фильтрации по имени"""
+        check_expired_products()
+        if search_text:
+            products = filter_products_by_name(search_text)
+        else:
+            products = get_all_products()
+
+        container = BoxLayout(orientation='vertical', size_hint_y=None)
+        container.bind(minimum_height=container.setter('height'))
+
+        for product in products:
+            product_id, name, product_type, manufacturing_date, expirationdate, mass, unit, *_ = product
+            product_box = BoxLayout(size_hint_y=None, height=50)
+
+
+            button_color = (1, 1, 1, 1)
+            if expirationdate and expirationdate != "Не указана":
+                try:
+                    exp_date = datetime.strptime(expirationdate, "%Y-%m-%d")
+                    days_left = (exp_date - datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)).days
+                    if days_left < 0:
+                        button_color = (1, 0, 0, 1)
+                    elif days_left == 1:
+                        button_color = (1, 1, 0, 1)
+                except ValueError:
+                    pass
+
+
+            name_button = Button(
+                text=f"{name}: {mass} {unit}",
+                size_hint_x=0.7,
+                background_color=button_color
+            )
+            name_button.bind(on_press=lambda instance, pid=product_id: self.show_product_details(pid))
+            product_box.add_widget(name_button)
+
+            container.add_widget(product_box)
+
+        self.product_list.clear_widgets()
+        self.product_list.add_widget(container)
+
+
+    def change_product_mass(self, product_id, mass_to_add):
+        """Изменяет массу/количество продукта по его ID"""
+        conn = sqlite3.connect('fridge.db')
+        c = conn.cursor()
+
+
+        c.execute('SELECT mass FROM products WHERE id = ?', (product_id,))
+        product = c.fetchone()
+
+        if product:
+            current_mass = float(product[0])
+            new_mass = current_mass + mass_to_add
+
+            if new_mass > 0:
+                c.execute('UPDATE products SET mass = ? WHERE id = ?', (new_mass, product_id))
+            else:
+                c.execute('DELETE FROM products WHERE id = ?', (product_id,))
+
+        conn.commit()
+        conn.close()
+
+        self.update_product_list()
+
+    def delete_product_handler(self, product_id):
+        conn = sqlite3.connect('fridge.db')
+        c = conn.cursor()
+        c.execute('DELETE FROM products WHERE id = ?', (product_id,))
+        conn.commit()
+        conn.close()
+        self.update_product_list()
+    def show_shopping_list_screen(self, instance):
+        content = ShoppingListScreen(self)
+        create_popup("Список покупок", content)
+
+    def show_popup(self, title, message):
+        content = BoxLayout(orientation="vertical", spacing=10, padding=10)
+        content.add_widget(Label(text=message))
+
+        ok_button = Button(text="OK", size_hint_y=None, height=40)
+        ok_button.bind(on_press=lambda instance: popup.dismiss())
+        content.add_widget(ok_button)
+
+        popup = create_popup(title, content)
+    def show_product_details(self, product_id):
+        conn = sqlite3.connect('fridge.db')
+        c = conn.cursor()
+        c.execute('SELECT * FROM products WHERE id = ?', (product_id,))
+        product = c.fetchone()
+        conn.close()
+
+        if product:
+            content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+            labels = [
+                f"Название: {product[1]}",
+                f"Тип: {product[2]}",
+                f"Дата изготовления: {product[3]}",
+                f"Дата истечения срока годности: {product[4]}",
+                f"Масса/Объем: {product[5]} {product[6]}",
+                f"Пищевая ценность: {product[7]}",
+                f"Тип измерения: {product[8]}"
+            ]
+
+            for text in labels:
+                content.add_widget(Label(text=text))
+
+            create_popup("Детали продукта", content)
+
+    def add_product_manually(self, instance):
+        content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        name_input = TextInput(hint_text="Название продукта")
+        type_input = TextInput(hint_text="Тип продукта (опционально)")
+        expiration_date_input = TextInput(hint_text="Дата истечения срока (ГГГГ-ММ-ДД)")
+        mass_input = TextInput(hint_text="Масса/Объем (по умолчанию 0)")
+        unit_input = TextInput(hint_text="Единица измерения (по умолчанию 'г')")
+
+        content.add_widget(name_input)
+        content.add_widget(type_input)
+        content.add_widget(expiration_date_input)
+        content.add_widget(mass_input)
+        content.add_widget(unit_input)
+
+        save_button = Button(text="Сохранить", size_hint_y=None, height=40)
+
+        def save_data(instance):
+            name = name_input.text.strip()
+            if not name:
+                self.show_popup("Ошибка", "Название продукта не может быть пустым.")
+                return
+            popup.dismiss()
+            self.update_product_list()
+            self.show_popup("Успех", "Продукт успешно добавлен.")
+
+        save_button.bind(on_press=save_data)
+        content.add_widget(save_button)
+
+        popup = create_popup("Добавить продукт", content)
+
+        def save_data(self, instance):
+            name = self.name_input.text.strip()
+            product_type = self.type_input.text.strip() or "Не указан"
+            manufacturing_date = self.manufacturing_date_input.text.strip() or "Не указана"
+            expiration_date = self.expiration_date_input.text.strip() or "Не указана"
+            mass = self.mass_input.text.strip() or "0"
+            unit = self.unit_input.text.strip() or "г"
+            nutritional_value = self.nutritional_value_input.text.strip() or "Не указана"
+            measurement_type = self.measurement_type_input.text.strip() or "Не указан"
+
+            if not name:
+                self.show_popup("Ошибка", "Название продукта не может быть пустым.")
+                return
+
+            try:
+                mass = float(mass)
+            except ValueError:
+                self.show_popup("Ошибка", "Масса должна быть числом.")
+                return
+
+            add_product(name, product_type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type)
+
+            self.popup.dismiss()
+            self.update_product_list()
+            self.show_popup("Успех", "Продукт успешно добавлен.")
+
+        self.save_button.bind(on_press=self.save_data)
+        self.popup.open()
+
+
+    def scan_and_add_product(self, instance):
+        scanned_data = scan_qr_code()
+        if scanned_data:
+            try:
+                data_dict = {}
+                for line in scanned_data.split('\n'):
+                    key, value = line.split(': ', 1)
+                    data_dict[key.strip()] = value.strip()
+
+                name = data_dict.get('Название', '')
+                product_type = data_dict.get('Тип', '')
+                manufacturing_date = data_dict.get('Дата изготовления', '')
+                expiration_date = data_dict.get('Дата истечения срока годности', '')
+                mass, unit = data_dict.get('Масса/Объем', '').split(' ', 1) if ' ' in data_dict.get('Масса/Объем', '') else ('', '')
+                nutritional_value = data_dict.get('Пищевая ценность', '')
+                measurement_type = data_dict.get('Тип измерения', '')
+
+                content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+                content.add_widget(Label(text=f"Название: {name}"))
+                content.add_widget(Label(text=f"Тип: {product_type}"))
+                content.add_widget(Label(text=f"Дата изготовления: {manufacturing_date}"))
+                content.add_widget(Label(text=f"Дата истечения срока годности: {expiration_date}"))
+                content.add_widget(Label(text=f"Масса/Объем: {mass} {unit}"))
+                content.add_widget(Label(text=f"Пищевая ценность: {nutritional_value}"))
+                content.add_widget(Label(text=f"Тип измерения: {measurement_type}"))
+
+                add_button = Button(text="Добавить", size_hint_y=None, height=40)
+                delete_button = Button(text="Удалить", size_hint_y=None, height=40)
+
+                buttons = BoxLayout(size_hint_y=None, height=40)
+                buttons.add_widget(add_button)
+                buttons.add_widget(delete_button)
+                content.add_widget(buttons)
+
+                popup = Popup(title="QR Код - Детали продукта", content=content, size_hint=(1, 1))
+
+                def add_to_fridge(instance):
+                    conn = sqlite3.connect('fridge.db')
+                    c = conn.cursor()
+                    c.execute('SELECT id, mass FROM products WHERE name = ? AND type = ?', (name, product_type))
+                    product = c.fetchone()
+                    if product:
+                        product_id, existing_mass = product
+                        new_mass = float(existing_mass) + float(mass)
+                        c.execute('UPDATE products SET mass = ? WHERE id = ?', (new_mass, product_id))
+                    else:
+                        c.execute('''INSERT INTO products (name, type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                (name, product_type, manufacturing_date, expiration_date, mass, unit, nutritional_value, measurement_type))
+                    conn.commit()
+                    conn.close()
+                    popup.dismiss()
+                    self.update_product_list()
+                    self.show_popup("Успех", "Продукт успешно добавлен в холодильник.")
+                    log_product_action(name, 'added')
+
+                def delete_from_fridge(instance):
+                    conn = sqlite3.connect('fridge.db')
+                    c = conn.cursor()
+                    c.execute('SELECT id, mass FROM products WHERE name = ? AND type = ?', (name, product_type))
+                    product = c.fetchone()
+                    if product:
+                        product_id, existing_mass = product
+                        new_mass = float(existing_mass) - float(mass)
+                        if new_mass > 0:
+                            c.execute('UPDATE products SET mass = ? WHERE id = ?', (new_mass, product_id))
+                        else:
+                            c.execute('DELETE FROM products WHERE id = ?', (product_id,))
+                    conn.commit()
+                    conn.close()
+                    popup.dismiss()
+                    self.update_product_list()
+                    self.show_popup("Успех", "Продукт успешно обновлён в холодильнике.")
+                    log_product_action(name, 'removed')
+
+                add_button.bind(on_press=add_to_fridge)
+                delete_button.bind(on_press=delete_from_fridge)
+
+                popup.open()
+
+            except Exception as e:
+                self.show_popup("Ошибка", f"Неверный формат данных QR-кода: {e}")
+
+    def delete_product_handler(self, product_id):
+        conn = sqlite3.connect('fridge.db')
+        c = conn.cursor()
+        c.execute('DELETE FROM products WHERE id = ?', (product_id,))
+        conn.commit()
+        conn.close()
+        self.update_product_list()
+
+    def show_popup(self, title, message):
+        content = BoxLayout(orientation='vertical')
+        content.add_widget(Label(text=message))
+        ok_button = Button(text="OK", size_hint_y=None, height=40)
+        content.add_widget(ok_button)
+
+        popup = Popup(title=title, content=content, size_hint=(0.7, 0.4))
+        ok_button.bind(on_press=popup.dismiss)
+        popup.open()
+
+
+
+class FridgeApp(App):
+    def build(self):
+        create_db()
+        create_shopping_list_db()
+        return MainScreen()
+
+
+if __name__ == '__main__':
+    FridgeApp().run()
