@@ -1,0 +1,1 @@
+# Vladv2008-SmartFridge-QR-Control-IoT-Sync-
